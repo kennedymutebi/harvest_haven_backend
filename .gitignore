@@ -1,0 +1,7 @@
+﻿.env
+.env.local
+.env.docker
+*.pyc
+__pycache__/
+*.log
+logs/

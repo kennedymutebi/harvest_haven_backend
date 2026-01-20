@@ -1,0 +1,57 @@
+﻿services:
+  db:
+    image: mysql:8.0
+    container_name: harvest_haven_db
+    restart: always
+    command: --port=3309 --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-backend_db}
+      MYSQL_USER: ${DB_USER:-harvest_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-newpassword123}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootpassword123}
+    ports:
+      - "3309:3309"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-P", "3309"]
+      timeout: 20s
+      retries: 10
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kennedymutebi/harvest-haven-backend:latest
+    container_name: harvest_haven_web
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py collectstatic --noinput &&
+             gunicorn harvest_haven.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120 --graceful-timeout 120 --keep-alive 5 --access-logfile - --error-logfile -"
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    ports:
+      - "8082:8000"
+    env_file:
+      - .env
+    environment:
+      # Database connection (must override for Docker networking)
+      - DB_HOST=db
+      - DB_PORT=3309
+      # SMS Configuration - Load from .env file, NO HARDCODED VALUES!
+      # These will use values from .env file
+      - AFRICASTALKING_USERNAME=${AFRICASTALKING_USERNAME}
+      - AFRICASTALKING_API_KEY=${AFRICASTALKING_API_KEY}
+      - AFRICASTALKING_SENDER_ID=${AFRICASTALKING_SENDER_ID}
+      - SMS_PROVIDER=${SMS_PROVIDER:-africastalking}
+      - SMS_ENABLED=${SMS_ENABLED:-True}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  static_volume:
+  media_volume:
