@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from authentication.models import User, MemberProfile
+from authentication.models import User, MemberProfile, Collector
 import re
 import uuid
 from django.db import transaction
@@ -12,14 +12,20 @@ class MemberListSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(source='user.email')
     phone_number = serializers.CharField(source='user.phone_number')
     total_savings = serializers.SerializerMethodField()
+    current_balance = serializers.SerializerMethodField()
+    collector_id = serializers.IntegerField(source='collector.id', read_only=True, default=None)
+    collector_name = serializers.SerializerMethodField()
     
     class Meta:
         model = MemberProfile
         fields = [
             'id', 'membership_id', 'full_name', 'email', 'phone_number',
-            'place_of_residence', 'date_joined', 'total_savings', 'is_active_member'
+            'place_of_residence', 'date_joined', 'total_savings', 'current_balance',
+            'is_active_member', 'registered_by', 'collector_id', 'collector_name'
         ]
     
+    def get_collector_name(self, obj):
+        return obj.collector.name if obj.collector else None
     def get_full_name(self, obj):
         return obj.user.get_full_name()
     
@@ -28,6 +34,14 @@ class MemberListSerializer(serializers.ModelSerializer):
         from django.db.models import Sum
         total = SavingsEntry.objects.filter(member=obj).aggregate(
             total=Sum('amount')
+        )['total']
+        return float(total) if total else 0.00
+
+    def get_current_balance(self, obj):
+        from savings.models import SavingsEntry
+        from django.db.models import Sum, F
+        total = SavingsEntry.objects.filter(member=obj).aggregate(
+            total=Sum(F('amount') - F('withdrawn_amount'))
         )['total']
         return float(total) if total else 0.00
 
@@ -41,6 +55,14 @@ class MemberDetailSerializer(serializers.ModelSerializer):
     phone_number = serializers.CharField(source='user.phone_number', read_only=True)
     full_name = serializers.SerializerMethodField()
     total_savings = serializers.SerializerMethodField()
+    current_balance = serializers.SerializerMethodField()
+    total_withdrawn = serializers.SerializerMethodField()
+    registered_by_name = serializers.SerializerMethodField()
+    collector_id = serializers.IntegerField(source='collector.id', read_only=True, default=None)
+    collector_name = serializers.SerializerMethodField()
+
+    def get_collector_name(self, obj):
+        return obj.collector.name if obj.collector else None
     
     class Meta:
         model = MemberProfile
@@ -49,7 +71,9 @@ class MemberDetailSerializer(serializers.ModelSerializer):
             'full_name', 'phone_number', 'place_of_residence', 'date_joined',
             'profile_picture', 'is_active_member', 'date_of_birth',
             'national_id', 'emergency_contact_name', 'emergency_contact_phone',
-            'total_savings', 'created_at', 'updated_at'
+            'total_savings', 'current_balance', 'total_withdrawn',
+            'registered_by', 'registered_by_name', 'collector_id', 'collector_name',
+            'created_at', 'updated_at'
         ]
     
     def get_full_name(self, obj):
@@ -63,6 +87,23 @@ class MemberDetailSerializer(serializers.ModelSerializer):
         )['total']
         return float(total) if total else 0.00
 
+    def get_current_balance(self, obj):
+        from savings.models import SavingsEntry
+        from django.db.models import Sum, F
+        total = SavingsEntry.objects.filter(member=obj).aggregate(
+            total=Sum(F('amount') - F('withdrawn_amount'))
+        )['total']
+        return float(total) if total else 0.00
+
+    def get_total_withdrawn(self, obj):
+        from savings.models import Withdrawal
+        from django.db.models import Sum
+        total = Withdrawal.objects.filter(member=obj).aggregate(total=Sum('amount'))['total']
+        return float(total) if total else 0.00
+
+    def get_registered_by_name(self, obj):
+        return obj.registered_by.get_full_name() if obj.registered_by else None
+
 
 class CreateMemberSerializer(serializers.Serializer):
     """For creating new member - Simplified with only essential fields"""
@@ -70,8 +111,15 @@ class CreateMemberSerializer(serializers.Serializer):
     # Required fields
     first_name = serializers.CharField(max_length=150)
     last_name = serializers.CharField(max_length=150)
-    phone_number = serializers.CharField(max_length=20)
-    place_of_residence = serializers.CharField(max_length=100)
+    # ✅ Optional now — a member can be registered with just a name
+    phone_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    place_of_residence = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    # Dropdown — which Collector this member belongs to
+    collector = serializers.PrimaryKeyRelatedField(
+        queryset=Collector.objects.filter(is_active=True),
+        required=True,
+        error_messages={'required': 'Please select which collector this member belongs to.'}
+    )
     
     def validate_first_name(self, value):
         """Validate first name"""
@@ -92,7 +140,10 @@ class CreateMemberSerializer(serializers.Serializer):
         return value
     
     def validate_phone_number(self, value):
-        """Validate and normalize phone number"""
+        """Validate and normalize phone number (optional — skip if blank)"""
+        if not value or not value.strip():
+            return None  # stored as NULL, not an empty string, so uniqueness still works
+
         # Remove spaces, dashes, parentheses
         cleaned = re.sub(r'[\s\-()]', '', value)
         
@@ -115,22 +166,22 @@ class CreateMemberSerializer(serializers.Serializer):
         return cleaned
     
     def validate_place_of_residence(self, value):
-        """Validate place of residence"""
+        """Place of residence is optional — normalize blank to None"""
+        if value is None:
+            return None
         value = value.strip()
-        if not value:
-            raise serializers.ValidationError("Place of residence cannot be empty")
-        return value
+        return value or None
     
     @transaction.atomic
     def create(self, validated_data):
-        """Create user and member profile"""
+        """Create user and member profile, attached to the chosen collector"""
         try:
             # Generate safe username from names
             first = re.sub(r'[^a-zA-Z0-9]', '', validated_data['first_name'].lower())
             last = re.sub(r'[^a-zA-Z0-9]', '', validated_data['last_name'].lower())
             
             # Limit username length
-            base_username = f"{first[:10]}{last[:10]}"
+            base_username = f"{first[:10]}{last[:10]}" or "member"
             
             # Make username unique
             username = base_username
@@ -150,7 +201,7 @@ class CreateMemberSerializer(serializers.Serializer):
                 email=None,  # ✅ Members don't need email
                 first_name=validated_data['first_name'],
                 last_name=validated_data['last_name'],
-                phone_number=validated_data['phone_number'],
+                phone_number=validated_data.get('phone_number') or None,
                 is_admin_approved=True,
                 is_active=False  # Members don't login
             )
@@ -158,13 +209,18 @@ class CreateMemberSerializer(serializers.Serializer):
             # Set unusable password
             user.set_unusable_password()
             user.save()
-            
-            # Create profile
+
+            # registered_by tracks which admin account created this record
+            request = self.context.get('request')
+            registered_by = request.user if request and request.user.is_authenticated else None
+
+            # Create profile, attached to the chosen collector
             profile = MemberProfile.objects.create(
                 user=user,
-                place_of_residence=validated_data['place_of_residence']
+                place_of_residence=validated_data.get('place_of_residence') or None,
+                registered_by=registered_by,
+                collector=validated_data['collector']
             )
-            
             return profile
             
         except Exception as e:
@@ -201,9 +257,9 @@ class UpdateMemberSerializer(serializers.Serializer):
         return value
     
     def validate_phone_number(self, value):
-        """Validate and normalize phone number"""
-        if not value:
-            return value
+        """Validate and normalize phone number (optional)"""
+        if not value or not value.strip():
+            return None
         
         # Remove spaces, dashes, parentheses
         cleaned = re.sub(r'[\s\-()]', '', value)
@@ -228,12 +284,10 @@ class UpdateMemberSerializer(serializers.Serializer):
         return cleaned
     
     def validate_place_of_residence(self, value):
-        """Validate place of residence"""
-        if value:
-            value = value.strip()
-            if not value:
-                raise serializers.ValidationError("Place of residence cannot be empty")
-        return value
+        """Place of residence is optional"""
+        if value is None:
+            return None
+        return value.strip() or None
     
     @transaction.atomic
     def update(self, instance, validated_data):

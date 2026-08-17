@@ -159,3 +159,61 @@ def send_otp_sms(user, otp):
     except Exception as e:
         print(f"SMS sending failed: {e}")
         return False
+def send_password_reset_email(user, reset_token):
+    """Send password reset link to user — matches your existing email style"""
+
+    reset_link = f"{settings.FRONTEND_URL}/reset-password?token={reset_token.token}"
+
+    subject = 'Reset Your Password - Harvest Haven SACCO'
+
+    html_content = f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #16a34a;">Password Reset Request</h2>
+                <p>Hello {user.first_name},</p>
+                <p>We received a request to reset your Harvest Haven SACCO password.
+                   Click the button below to choose a new password:</p>
+
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="{reset_link}"
+                       style="background-color: #16a34a; color: white; padding: 14px 36px;
+                              text-decoration: none; border-radius: 5px;
+                              display: inline-block; font-size: 16px; font-weight: bold;">
+                        Reset My Password
+                    </a>
+                </div>
+
+                <div style="background-color: #f5f5f5; padding: 16px;
+                            border-radius: 5px; margin: 20px 0;">
+                    <p style="margin: 0; color: #555; font-size: 14px;">
+                        ⏱ This link expires in <strong>30 minutes</strong>.<br>
+                        🔒 If you did not request a password reset, ignore this email —
+                        your account is safe.
+                    </p>
+                </div>
+
+                <p style="color: #999; font-size: 12px;">
+                    If the button above doesn't work, copy and paste this link into your browser:<br>
+                    <a href="{reset_link}" style="color: #16a34a;">{reset_link}</a>
+                </p>
+
+                <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 24px 0;">
+                <p style="color: #999; font-size: 12px; text-align: center;">
+                    Harvest Haven SACCO &mdash; Kampala, Uganda
+                </p>
+            </div>
+        </body>
+    </html>
+    """
+
+    text_content = strip_tags(html_content)
+
+    email = EmailMultiAlternatives(
+        subject,
+        text_content,
+        settings.DEFAULT_FROM_EMAIL,
+        [user.email]
+    )
+    email.attach_alternative(html_content, "text/html")
+    email.send()

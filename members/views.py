@@ -30,10 +30,21 @@ class MemberViewSet(viewsets.ModelViewSet):
         return MemberDetailSerializer
     
     def list(self, request, *args, **kwargs):
-        """GET /api/members/"""
+        """GET /api/members/
+
+        By default, only returns the members that the logged-in collector
+        personally registered — each collector sees just "their people".
+        Pass ?all=true (staff/superusers only) to see everyone.
+        """
         try:
             queryset = self.get_queryset()
-            
+
+# Admin sees everyone by default; optionally filter to one collector's people
+            collector_id = request.query_params.get('collector')
+            if collector_id:
+                queryset = queryset.filter(collector_id=collector_id)
+
+            # Search by name, email, membership_id
             # Search by name, email, membership_id
             search = request.query_params.get('search', '')
             if search:

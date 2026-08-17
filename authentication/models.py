@@ -5,6 +5,7 @@ from django.utils import timezone
 from datetime import timedelta
 import random
 import string
+import uuid
 
 
 class User(AbstractUser):
@@ -21,9 +22,9 @@ class User(AbstractUser):
                 message="Phone number must be entered in the format: '+256700123456'. Up to 15 digits allowed."
             )
         ],
-        unique=True,  # ✅ Phone number is the main unique identifier
-        blank=False,
-        null=False
+        unique=True,  # still unique when provided
+        blank=True,
+        null=True  # ✅ Optional now — members can be registered without a phone number
     )
     
     # Only admin approval is needed now
@@ -50,15 +51,67 @@ class User(AbstractUser):
         return hasattr(self, 'profile') and self.email is None
 
 
+class Collector(models.Model):
+    """A person who collects savings from members in the field.
+    Created and managed by an admin. Collectors do not log in —
+    this is just a name + phone number the admin uses to organize members."""
+
+    name = models.CharField(max_length=150)
+    phone_number = models.CharField(
+        max_length=15,
+        validators=[
+            RegexValidator(
+                regex=r'^\+?1?\d{9,15}$',
+                message="Phone number must be entered in the format: '+256700123456'. Up to 15 digits allowed."
+            )
+        ],
+        blank=True,
+        null=True
+    )
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='collectors_created'
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'collectors'
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
 class MemberProfile(models.Model):
     """Extended profile information for members"""
     
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
     membership_id = models.CharField(max_length=10, unique=True, editable=False)
-    place_of_residence = models.CharField(max_length=100)
+    place_of_residence = models.CharField(max_length=100, blank=True, null=True)  # ✅ Optional now
     date_joined = models.DateField(auto_now_add=True)
     profile_picture = models.ImageField(upload_to='profile_pictures/', blank=True, null=True)
     is_active_member = models.BooleanField(default=True)
+
+    # Tracks which admin account created this record (audit trail only).
+    registered_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='registered_members'
+    )
+
+    # The Collector this member is attached to — chosen from a dropdown
+    # by the admin when creating the member. Determines whose "people"
+    # this member counts toward in daily/monthly savings summaries.
+    collector = models.ForeignKey(
+        Collector,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='members'
+    )
     
     # Additional fields
     date_of_birth = models.DateField(blank=True, null=True)
@@ -171,3 +224,22 @@ class PendingApproval(models.Model):
         if not self.approval_token:
             self.approval_token = self.generate_approval_token()
         super().save(*args, **kwargs)
+
+
+class PasswordResetToken(models.Model):
+    """Token for password reset via email link"""
+    
+    user       = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reset_tokens')
+    token      = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_used    = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = 'password_reset_tokens'
+        ordering = ['-created_at']
+
+    def is_valid(self):
+        return not self.is_used and timezone.now() < self.created_at + timedelta(minutes=30)
+
+    def __str__(self):
+        return f"ResetToken({self.user.email})"

@@ -77,6 +77,7 @@ WSGI_APPLICATION = 'harvest_haven.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
+        
         'NAME': os.environ.get('DB_NAME', 'backend_db'),
         'USER': os.environ.get('DB_USER', 'root'),
         'PASSWORD': os.environ.get('DB_PASSWORD', 'newpassword123'),  # Default fallback
@@ -87,7 +88,7 @@ DATABASES = {
         },
     }
 }
-
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', 'testserver']  # add your existing entries too
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -139,18 +140,13 @@ BACKEND_URL = os.environ.get('BACKEND_URL', 'http://10.10.158.81:8000')
 # SMS CONFIGURATION - Multi-Provider Support
 # ============================================
 
-# SMS Provider Selection (twilio or africastalking)
-SMS_PROVIDER = os.environ.get('SMS_PROVIDER', 'twilio').lower()
+
 SMS_ENABLED = os.environ.get('SMS_ENABLED', 'True') == 'True'
 
-# Twilio Configuration (Backup/Legacy)
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '')
-TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER', '')
-# Africa's Talking Configuration (Primary)
-# FIXED: Correct environment variable names (no underscore after AFRICA)
-AFRICASTALKING_USERNAME = os.environ.get('AFRICASTALKING_USERNAME', 'sandbox')
-AFRICASTALKING_API_KEY = os.environ.get('AFRICASTALKING_API_KEY', '')
+# EgoSMS credentials (register free at https://www.egosms.co)
+EGOSMS_USERNAME = os.environ.get('EGOSMS_USERNAME', '')
+EGOSMS_PASSWORD = os.environ.get('EGOSMS_PASSWORD', '')
+EGOSMS_SENDER_ID = os.environ.get('EGOSMS_SENDER_ID', 'HarvestHvn')
 
 
 # Custom User Model

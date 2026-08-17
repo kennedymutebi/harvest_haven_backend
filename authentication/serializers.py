@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth import authenticate
-from .models import User, MemberProfile, OTPToken
+from .models import User, MemberProfile, Collector
 
 
 class MemberProfileSerializer(serializers.ModelSerializer):
@@ -15,6 +15,25 @@ class MemberProfileSerializer(serializers.ModelSerializer):
             'national_id', 'emergency_contact_name', 'emergency_contact_phone'
         ]
         read_only_fields = ['membership_id', 'date_joined']
+
+class CollectorSerializer(serializers.ModelSerializer):
+    """Serializer for Collector — name + phone only, admin-managed."""
+
+    class Meta:
+        model = Collector
+        fields = ['id', 'name', 'phone_number', 'is_active', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Name cannot be empty.")
+        return value
+
+    def validate_phone_number(self, value):
+        if not value or not value.strip():
+            return None
+        return value.strip()
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -80,79 +99,37 @@ class SignUpSerializer(serializers.ModelSerializer):
 
 
 class LoginSerializer(serializers.Serializer):
-    """Serializer for user login - Step 1: Credentials"""
-    
+    """Serializer for user login - email + password only, no OTP"""
+
     email = serializers.EmailField(required=True)
     password = serializers.CharField(required=True, write_only=True)
-    
+
     def validate(self, attrs):
         email = attrs.get('email')
         password = attrs.get('password')
-        
-        if email and password:
-            user = authenticate(request=self.context.get('request'),
-                                username=email, password=password)
-            
-            if not user:
-                raise serializers.ValidationError('Invalid email or password.')
-            
-            if not user.is_active:
-                raise serializers.ValidationError('User account is disabled.')
-            
-            # Remove this line because email verification no longer exists
-            # if not user.is_email_verified:
-            #     raise serializers.ValidationError('Please verify your email address first.')
-            
-            if not user.is_admin_approved:
-                raise serializers.ValidationError('Your account is pending admin approval.')
-            
-        else:
+
+        if not email or not password:
             raise serializers.ValidationError('Must include "email" and "password".')
-        
-        attrs['user'] = user
-        return attrs
 
-
-
-class OTPVerifySerializer(serializers.Serializer):
-    """Serializer for OTP verification - Step 2: OTP"""
-    
-    email = serializers.EmailField(required=True)
-    otp = serializers.CharField(required=True, max_length=6, min_length=6)
-    
-    def validate(self, attrs):
-        email = attrs.get('email')
-        otp = attrs.get('otp')
-        
         try:
-            user = User.objects.get(email=email)
+            user_obj = User.objects.get(email=email)
         except User.DoesNotExist:
-            raise serializers.ValidationError('Invalid credentials.')
-        
-        # Get the latest valid OTP
-        otp_token = OTPToken.objects.filter(
-            user=user,
-            otp=otp,
-            is_used=False
-        ).order_by('-created_at').first()
-        
-        if not otp_token:
-            raise serializers.ValidationError('Invalid or expired OTP.')
-        
-        # Check if expired
-        if not otp_token.is_valid():
-            raise serializers.ValidationError('OTP has expired.')
-        
-        # Check attempts BEFORE incrementing
-        if otp_token.attempts >= otp_token.max_attempts:
-            raise serializers.ValidationError('Maximum OTP attempts exceeded. Please request a new OTP.')
-        
-        # Increment attempts only after validation passes
-        otp_token.attempts += 1
-        otp_token.save()
-        
+            raise serializers.ValidationError('Invalid email or password.')
+
+        # Authenticate by username field internally, since USERNAME_FIELD='username'
+        user = authenticate(request=self.context.get('request'),
+                             username=user_obj.username, password=password)
+
+        if not user:
+            raise serializers.ValidationError('Invalid email or password.')
+
+        if not user.is_active:
+            raise serializers.ValidationError('User account is disabled.')
+
+        if not user.is_admin_approved:
+            raise serializers.ValidationError('Your account is pending admin approval.')
+
         attrs['user'] = user
-        attrs['otp_token'] = otp_token
         return attrs
 
 class ResendOTPSerializer(serializers.Serializer):
@@ -190,3 +167,15 @@ class PasswordResetRequestSerializer(serializers.Serializer):
         if not User.objects.filter(email=value).exists():
             raise serializers.ValidationError("No user found with this email address.")
         return value
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    """Serializer for confirming password reset with token"""
+
+    token        = serializers.UUIDField(required=True)
+    new_password = serializers.CharField(required=True, write_only=True,
+                                         validators=[validate_password])
+    confirm_password = serializers.CharField(required=True, write_only=True)
+
+    def validate(self, attrs):
+        if attrs['new_password'] != attrs['confirm_password']:
+            raise serializers.ValidationError({'confirm_password': 'Passwords do not match.'})
+        return attrs
