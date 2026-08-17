@@ -73,14 +73,14 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'harvest_haven.wsgi.application'
 
-# Database Configuration - Using environment variables
+# Database Configuration - Using environment variables i cover
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         
         'NAME': os.environ.get('DB_NAME', 'backend_db'),
         'USER': os.environ.get('DB_USER', 'root'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', 'newpassword123'),  # Default fallback
+        'PASSWORD': os.environ.get('DB_PASSWORD', 'newpassword123'),  # Default fallback is here
         'HOST': os.environ.get('DB_HOST', 'localhost'),
         'PORT': os.environ.get('DB_PORT', '3306'),
         'OPTIONS': {
