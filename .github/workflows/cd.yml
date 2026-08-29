@@ -31,11 +31,11 @@ jobs:
           push: true
           tags: |
             kennedymutebi/harvest-haven-backend:${{ github.sha }}
-            kennedymutebi/harvest-haven-backend:latest
+            kennedymutebi/harvest-haven-backend:build-${{ github.run_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-    deploy:
+  deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
