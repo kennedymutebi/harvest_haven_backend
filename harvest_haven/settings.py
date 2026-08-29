@@ -88,7 +88,7 @@ DATABASES = {
         },
     }
 }
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', 'testserver']  # add your existing entries too
+
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
