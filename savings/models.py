@@ -41,6 +41,15 @@ class SavingsCycle(models.Model):
         total = self.savings_entries.aggregate(total=models.Sum('amount'))['total']
         return total or Decimal('0.00')
 
+    # ✅ NEW: withdrawals are now scoped to a cycle, so this only sums
+    # withdrawals actually made *within* this cycle.
+    def total_withdrawals(self):
+        total = self.withdrawals.aggregate(total=models.Sum('amount'))['total']
+        return total or Decimal('0.00')
+
+    def closing_balance(self):
+        return self.total_savings() - self.total_withdrawals()
+
     def total_profit(self):
         total = self.total_savings()
         if not isinstance(total, Decimal):
@@ -49,6 +58,14 @@ class SavingsCycle(models.Model):
 
     def member_count(self):
         return self.savings_entries.values('member').distinct().count()
+
+    def previous_cycle(self):
+        """The cycle immediately before this one, by start_date. Used purely
+        for the informational 'carry-forward' figure — it is NEVER pulled
+        into this cycle's own totals."""
+        return SavingsCycle.objects.filter(
+            start_date__lt=self.start_date
+        ).order_by('-start_date').first()
 
 
 class SavingsEntry(models.Model):
@@ -79,6 +96,13 @@ class SavingsEntry(models.Model):
     )
     date = models.DateField()
     comment = models.TextField(blank=True, null=True)
+
+    # ✅ NEW: marks an entry deliberately backdated into a past/closed cycle
+    # via the "late save" tool, as opposed to a normal same-cycle deposit.
+    # Purely informational — cycle scoping already keeps it out of the
+    # active cycle's totals regardless of this flag.
+    is_late_entry = models.BooleanField(default=False)
+
     created_by = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
@@ -99,17 +123,38 @@ class SavingsEntry(models.Model):
     def remaining_amount(self):
         return self.amount - self.withdrawn_amount
 
+    @property
+    def is_withdrawn_from(self):
+        """True if any withdrawal has ever drawn from this specific deposit.
+        Used to block deletion of an entry that's part of a withdrawal's
+        FIFO trail, which would corrupt that history."""
+        return self.withdrawal_allocations.exists()
+
 
 class Withdrawal(models.Model):
     """A withdrawal made by a member. Doesn't delete any deposit — it draws
     down the oldest deposits first (FIFO) via WithdrawalAllocation rows, and
     always records a reason so the money's movement stays visible.
+
+    ✅ FIX: withdrawals are now scoped to a SavingsCycle, exactly like
+    SavingsEntry. This is what makes a new cycle start completely clean:
+    a withdrawal made in the new cycle can only draw down deposits made in
+    that SAME cycle, and only ever appears in that cycle's own totals.
+    Older cycles' deposits and withdrawals are never touched by anything
+    happening in the new cycle.
     """
 
     member = models.ForeignKey(
         MemberProfile,
         on_delete=models.CASCADE,
         related_name='withdrawals'
+    )
+    cycle = models.ForeignKey(
+        SavingsCycle,
+        on_delete=models.CASCADE,
+        related_name='withdrawals',
+        null=True,   # null=True only to allow the migration to run against
+        blank=True,  # existing rows; see backfill script — new rows always get one.
     )
     amount = models.DecimalField(
         max_digits=10,
