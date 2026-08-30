@@ -124,11 +124,9 @@ class SavingsEntryViewSet(viewsets.ModelViewSet):
         """
         DELETE /api/savings/{id}/
 
-        ✅ GUARD: if a withdrawal has already drawn from this deposit
+        GUARD: if a withdrawal has already drawn from this deposit
         (i.e. it has WithdrawalAllocation rows), deleting it would corrupt
-        that withdrawal's FIFO trail — so this is blocked. This matters
-        most for late-save entries, since those are the ones an admin is
-        likely to delete after the fact.
+        that withdrawal's FIFO trail — so this is blocked.
         """
         entry = self.get_object()
         if entry.is_withdrawn_from:
@@ -148,16 +146,10 @@ class SavingsEntryViewSet(viewsets.ModelViewSet):
 
 class LateSavingsEntryView(APIView):
     """
-    GET  /api/savings/late-entry/lookup/?cycle_id={id}
     POST /api/savings/late-entry/
 
-    Convenience wrapper around the same create logic as SavingsEntryViewSet,
-    purpose-built for the "add last month's saving" workflow:
-      1. Admin picks a past/closed cycle.
-      2. Searches for the member (see MemberSearchView).
-      3. Submits amount/date/comment here with that cycle id.
-    Functionally identical to POST /api/savings/ with a cycle in the body —
-    this just exists as a clearly-named endpoint for the frontend to hit.
+    Backdate a saving into a specific past/closed cycle. Excluded from the
+    active cycle's totals entirely, since cycle scoping already does that.
     """
 
     permission_classes = [IsAuthenticated]
@@ -177,13 +169,7 @@ class LateSavingsEntryView(APIView):
 
 
 class MemberSearchView(APIView):
-    """
-    GET /api/members/search/?q=<name, membership id, or phone>
-
-    Lightweight member search across ALL members (any collector, any
-    active/inactive status), used by the late-save picker so an admin can
-    find anyone regardless of which cycle is currently active.
-    """
+    """GET /api/members/search/?q=<name, membership id, or phone>"""
 
     permission_classes = [IsAuthenticated]
 
@@ -404,14 +390,7 @@ class WithdrawalViewSet(viewsets.ModelViewSet):
 # ============================================
 
 class MembersListWithSavingsView(APIView):
-    """
-    GET /api/view-savings/members/
-
-    ✅ FIX: total_withdrawn is now scoped to the active cycle, matching
-    total_savings. Previously this summed EVERY withdrawal the member had
-    ever made, across all cycles, which is exactly what produced negative
-    balances the moment a new cycle started.
-    """
+    """GET /api/view-savings/members/"""
 
     permission_classes = [IsAuthenticated]
 
@@ -447,7 +426,6 @@ class MembersListWithSavingsView(APIView):
                 cycle=active_cycle
             ).aggregate(total=Sum('amount'))['total'] or 0
 
-            # ✅ scoped to the active cycle, not all-time
             total_withdrawn = Withdrawal.objects.filter(
                 member=member,
                 cycle=active_cycle
@@ -475,13 +453,7 @@ class MembersListWithSavingsView(APIView):
 
 
 class MemberSavingsDetailView(APIView):
-    """
-    GET /api/view-savings/members/{member_id}/
-
-    ✅ FIX: "lifetime" figures are now clearly separated from "this cycle"
-    figures, and this-cycle withdrawals are properly scoped to the active
-    cycle instead of being summed across all cycles.
-    """
+    """GET /api/view-savings/members/{member_id}/"""
 
     permission_classes = [IsAuthenticated]
 
@@ -518,7 +490,6 @@ class MemberSavingsDetailView(APIView):
             'comment': entry.comment or ''
         } for entry in entries]
 
-        # This-cycle withdrawals only (matches summary numbers above)
         withdrawals_list = [{
             'id': w.id,
             'date': w.date.strftime('%b %d, %Y'),
@@ -543,7 +514,11 @@ class MemberSavingsDetailView(APIView):
             'total_withdrawn_lifetime': float(total_withdrawn_lifetime),
             'net_balance_lifetime': float(total_lifetime) - float(total_withdrawn_lifetime),
 
-            # This cycle only — these are the numbers that now correctly reset to 0
+            # ✅ Frontend (WithdrawPage.tsx) reads this exact field name.
+            # Points at the ACTIVE CYCLE's balance — the same number the
+            # withdrawal endpoint validates against.
+            'net_balance': float(summary['closing_balance']),
+
             'total_this_month': float(summary['savings']),
             'total_withdrawn_this_month': float(summary['withdrawals']),
             'balance_this_month': float(summary['closing_balance']),
@@ -556,13 +531,7 @@ class MemberSavingsDetailView(APIView):
 
 
 class MemberSavingsHistoryView(APIView):
-    """
-    GET /api/view-savings/members/{member_id}/history/
-
-    Now built on get_member_lifetime_history(), so each cycle's row is an
-    independent, correctly-scoped summary — including withdrawals, which
-    were previously missing from this view entirely.
-    """
+    """GET /api/view-savings/members/{member_id}/history/"""
 
     permission_classes = [IsAuthenticated]
 
@@ -605,7 +574,7 @@ class MemberSavingsHistoryView(APIView):
 
 
 # ============================================
-# EXCEL EXPORTS
+# EXCEL EXPORTS  (Phase 2 — matches savings/exports.py exactly)
 # ============================================
 
 def _xlsx_response(buf, filename):
@@ -622,8 +591,7 @@ class CycleExportView(APIView):
     GET /api/savings/export/cycle/?cycle_id=<id>
 
     Covers both "all members" (no cycle_id -> active cycle) and
-    "selected cycle/month" (cycle_id given) exports — same report,
-    different cycle.
+    "selected cycle/month" (cycle_id given) — same report, different cycle.
     """
 
     permission_classes = [IsAuthenticated]
@@ -640,6 +608,8 @@ class CycleExportView(APIView):
             if not cycle:
                 return Response({'error': 'No active cycle found'}, status=status.HTTP_404_NOT_FOUND)
 
+        # build_cycle_export queries members itself if none passed, but we
+        # can scope it explicitly here to active members only.
         members = MemberProfile.objects.filter(is_active_member=True).select_related('user')
         buf = build_cycle_export(cycle, members)
         filename = f"{cycle.name.replace(' ', '_')}_savings.xlsx"
@@ -707,6 +677,7 @@ class AllCollectorsExportView(APIView):
         ]
         buf = build_all_collectors_export(collectors_with_members, cycle=cycle)
         return _xlsx_response(buf, 'all_collectors_summary.xlsx')
+
 
 # ============================================
 # PDF EXPORTS
