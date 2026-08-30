@@ -68,7 +68,7 @@ def build_cycle_pdf(cycle, members_queryset):
     """One table, one row per member, for a single cycle — same data as
     the 'all members' / 'selected cycle' Excel export."""
     story = [
-        Paragraph(f"{cycle.name} — Savings Report", TITLE_STYLE),
+        Paragraph(f"{cycle.name} —  Mutundwe Development Savings Report", TITLE_STYLE),
         Paragraph(
             f"{cycle.start_date} to {cycle.end_date or 'ongoing'} &middot; "
             f"Status: {cycle.get_status_display()}",
@@ -114,7 +114,7 @@ def build_member_statement_pdf(member):
     name = member.user.get_full_name() if hasattr(member, 'user') else str(member)
 
     story = [
-        Paragraph("Member Savings Statement", TITLE_STYLE),
+        Paragraph(" Mutundwe Development member Savings Statement", TITLE_STYLE),
         Paragraph(f"{name} &middot; Membership ID: {member.membership_id}", SUBTITLE_STYLE),
     ]
 
@@ -143,7 +143,7 @@ def build_collector_pdf(collector, members_queryset, cycle=None):
     """One-page summary card for a single collector — same numbers as
     the collector Excel export."""
     story = [
-        Paragraph(f"Collector Summary — {collector.name}", TITLE_STYLE),
+        Paragraph(f" Mutundwe Development Collector Summary — {collector.name}", TITLE_STYLE),
     ]
     if cycle:
         story.append(Paragraph(f"Cycle: {cycle.name}", SUBTITLE_STYLE))
