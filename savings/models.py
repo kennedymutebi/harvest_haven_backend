@@ -33,6 +33,19 @@ class SavingsCycle(models.Model):
     class Meta:
         db_table = 'savings_cycles'
         ordering = ['-start_date']
+        # ✅ NEW: the database itself now rejects any attempt to create or
+        # update a second cycle with status='active'. This is what caused
+        # the whole "balance not reducing" bug — two rows both had
+        # status='active' at once, so which one `.filter(status='active')
+        # .first()` returned was effectively random depending on query
+        # timing, and savings/withdrawals ended up split across both.
+        constraints = [
+            models.UniqueConstraint(
+                fields=['status'],
+                condition=models.Q(status='active'),
+                name='only_one_active_cycle'
+            )
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.status})"
@@ -136,12 +149,12 @@ class Withdrawal(models.Model):
     down the oldest deposits first (FIFO) via WithdrawalAllocation rows, and
     always records a reason so the money's movement stays visible.
 
-    ✅ FIX: withdrawals are now scoped to a SavingsCycle, exactly like
-    SavingsEntry. This is what makes a new cycle start completely clean:
-    a withdrawal made in the new cycle can only draw down deposits made in
-    that SAME cycle, and only ever appears in that cycle's own totals.
-    Older cycles' deposits and withdrawals are never touched by anything
-    happening in the new cycle.
+    Withdrawals are scoped to a SavingsCycle, exactly like SavingsEntry.
+    This is what makes a new cycle start completely clean: a withdrawal
+    made in the new cycle can only draw down deposits made in that SAME
+    cycle, and only ever appears in that cycle's own totals. Older cycles'
+    deposits and withdrawals are never touched by anything happening in
+    the new cycle.
     """
 
     member = models.ForeignKey(
@@ -149,12 +162,14 @@ class Withdrawal(models.Model):
         on_delete=models.CASCADE,
         related_name='withdrawals'
     )
+    # ✅ CHANGED: no longer nullable. The one-time backfill (Aug 2026) has
+    # already assigned every pre-existing null-cycle withdrawal to its
+    # correct cycle, so this is now safe to enforce at the DB level —
+    # every new withdrawal MUST have a cycle going forward.
     cycle = models.ForeignKey(
         SavingsCycle,
         on_delete=models.CASCADE,
-        related_name='withdrawals',
-        null=True,   # null=True only to allow the migration to run against
-        blank=True,  # existing rows; see backfill script — new rows always get one.
+        related_name='withdrawals'
     )
     amount = models.DecimalField(
         max_digits=10,
