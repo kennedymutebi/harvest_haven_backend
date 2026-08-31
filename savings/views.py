@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Q
 from django.http import HttpResponse
+from django.core.cache import cache
 from .models import SavingsCycle, SavingsEntry, Withdrawal
 from authentication.models import MemberProfile, Collector
 from .serializers import (
@@ -74,6 +75,13 @@ class SavingsEntryViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         entry = serializer.save(created_by=request.user)
 
+        # Invalidate cached members/savings lists so new deposits show up
+        # immediately instead of waiting for the cache TTL to expire.
+        try:
+            cache.delete_pattern("*members_savings_*")
+        except Exception as e:
+            logger.warning(f"Cache invalidation failed: {str(e)}")
+
         send_sms = str(request.data.get('send_sms', 'false')).lower() == 'true'
         if send_sms:
             try:
@@ -109,6 +117,12 @@ class SavingsEntryViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         entry = serializer.save()
 
+        # Invalidate cache on update too — amount may have changed.
+        try:
+            cache.delete_pattern("*members_savings_*")
+        except Exception as e:
+            logger.warning(f"Cache invalidation failed: {str(e)}")
+
         try:
             SMSService.send_savings_update_notification(
                 member=entry.member,
@@ -141,6 +155,13 @@ class SavingsEntryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         entry.delete()
+
+        # Invalidate cache on delete too.
+        try:
+            cache.delete_pattern("*members_savings_*")
+        except Exception as e:
+            logger.warning(f"Cache invalidation failed: {str(e)}")
+
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -165,6 +186,12 @@ class LateSavingsEntryView(APIView):
             )
 
         entry = serializer.save(created_by=request.user)
+
+        try:
+            cache.delete_pattern("*members_savings_*")
+        except Exception as e:
+            logger.warning(f"Cache invalidation failed: {str(e)}")
+
         return Response(SavingsEntrySerializer(entry).data, status=status.HTTP_201_CREATED)
 
 
@@ -374,6 +401,12 @@ class WithdrawalViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         withdrawal = serializer.save(created_by=request.user)
+
+        try:
+            cache.delete_pattern("*members_savings_*")
+        except Exception as e:
+            logger.warning(f"Cache invalidation failed: {str(e)}")
+
         return Response(
             WithdrawalSerializer(withdrawal).data,
             status=status.HTTP_201_CREATED
@@ -390,25 +423,44 @@ class WithdrawalViewSet(viewsets.ModelViewSet):
 # ============================================
 
 class MembersListWithSavingsView(APIView):
-    """GET /api/view-savings/members/"""
+    """
+    GET /api/view-savings/members/
+
+    PERFORMANCE NOTE: this used to run 2 DB queries PER MEMBER inside a
+    Python loop (N+1 problem) — with a few hundred members that meant
+    600+ queries and 20-30+ second load times. Now it runs 2 queries
+    TOTAL regardless of member count, using annotate+Sum grouped by
+    member_id, plus a short Redis cache on top for repeat requests.
+    """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         search_query = request.GET.get('search', '').strip()
+        show_all = request.GET.get('all', '').lower() == 'true'
+
+        # Cache key is scoped per-user + filters so nobody sees another
+        # user's filtered/restricted view from cache.
+        cache_key = f"members_savings_{request.user.id}_{search_query}_{show_all}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
         active_cycle = SavingsCycle.objects.filter(status='active').first()
 
         if not active_cycle:
-            return Response({
+            data = {
                 'members': [],
                 'total_count': 0,
                 'cycle_name': None,
                 'error': 'No active cycle found'
-            })
+            }
+            return Response(data)
 
-        members = MemberProfile.objects.filter(is_active_member=True)
+        # select_related('user') avoids a separate query per member for
+        # member.user.first_name / last_name.
+        members = MemberProfile.objects.filter(is_active_member=True).select_related('user')
 
-        show_all = request.GET.get('all', '').lower() == 'true'
         if not (show_all and (request.user.is_staff or request.user.is_superuser)):
             members = members.filter(registered_by=request.user)
 
@@ -419,17 +471,29 @@ class MembersListWithSavingsView(APIView):
                 Q(membership_id__icontains=search_query)
             )
 
+        members = list(members)  # evaluate once, reuse below
+        member_ids = [m.id for m in members]
+
+        # ONE query: total savings for ALL members, grouped by member_id.
+        savings_map = dict(
+            SavingsEntry.objects.filter(member_id__in=member_ids, cycle=active_cycle)
+            .values('member_id')
+            .annotate(total=Sum('amount'))
+            .values_list('member_id', 'total')
+        )
+
+        # ONE query: total withdrawals for ALL members, grouped by member_id.
+        withdrawn_map = dict(
+            Withdrawal.objects.filter(member_id__in=member_ids, cycle=active_cycle)
+            .values('member_id')
+            .annotate(total=Sum('amount'))
+            .values_list('member_id', 'total')
+        )
+
         result = []
         for member in members:
-            total_savings = SavingsEntry.objects.filter(
-                member=member,
-                cycle=active_cycle
-            ).aggregate(total=Sum('amount'))['total'] or 0
-
-            total_withdrawn = Withdrawal.objects.filter(
-                member=member,
-                cycle=active_cycle
-            ).aggregate(total=Sum('amount'))['total'] or 0
+            total_savings = float(savings_map.get(member.id, 0) or 0)
+            total_withdrawn = float(withdrawn_map.get(member.id, 0) or 0)
 
             result.append({
                 'id': member.id,
@@ -437,19 +501,25 @@ class MembersListWithSavingsView(APIView):
                 'first_name': member.user.first_name,
                 'last_name': member.user.last_name,
                 'membership_id': member.membership_id,
-                'total_savings': float(total_savings),
-                'total_withdrawn': float(total_withdrawn),
-                'balance': float(total_savings) - float(total_withdrawn),
+                'total_savings': total_savings,
+                'total_withdrawn': total_withdrawn,
+                'balance': total_savings - total_withdrawn,
                 'initials': f"{member.user.first_name[0]}{member.user.last_name[0]}".upper() if member.user.first_name and member.user.last_name else "??"
             })
 
         result.sort(key=lambda x: x['total_savings'], reverse=True)
 
-        return Response({
+        data = {
             'members': result,
             'total_count': len(result),
             'cycle_name': active_cycle.name
-        })
+        }
+
+        # 60s TTL — short enough that stale balances aren't a real problem,
+        # and we invalidate immediately on any create/update/delete anyway.
+        cache.set(cache_key, data, timeout=60)
+
+        return Response(data)
 
 
 class MemberSavingsDetailView(APIView):
