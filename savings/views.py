@@ -442,7 +442,11 @@ class MembersListWithSavingsView(APIView):
         # Cache key is scoped per-user + filters so nobody sees another
         # user's filtered/restricted view from cache.
         cache_key = f"members_savings_{request.user.id}_{search_query}_{show_all}"
-        cached = cache.get(cache_key)
+        try:
+            cached = cache.get(cache_key)
+        except Exception as e:
+            logger.warning(f"Cache read failed: {str(e)}")
+            cached = None
         if cached is not None:
             return Response(cached)
 

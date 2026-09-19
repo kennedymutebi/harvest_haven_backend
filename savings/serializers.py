@@ -1,9 +1,12 @@
 from decimal import Decimal
-from django.db import transaction
-from django.db.models import Sum, F
 from rest_framework import serializers
 from .models import SavingsCycle, SavingsEntry, Withdrawal, WithdrawalAllocation
 from authentication.models import MemberProfile
+from .infrastructure import (
+    execute_withdrawal,
+    InsufficientBalanceForWithdrawal,
+    get_cycle_total_profit,
+)
 
 
 class SavingsCycleSerializer(serializers.ModelSerializer):
@@ -34,7 +37,10 @@ class SavingsCycleSerializer(serializers.ModelSerializer):
         return float(obj.closing_balance())
 
     def get_total_profit(self, obj):
-        return float(obj.total_profit())
+        # PATCHED: was float(obj.total_profit()) - interest_rate% of the
+        # WHOLE cycle's deposits. Now sums the Section 7 tiered flat fee
+        # PER MEMBER instead - see savings/infrastructure.py.
+        return float(get_cycle_total_profit(obj))
 
     def get_member_count(self, obj):
         return obj.member_count()
@@ -175,22 +181,17 @@ class WithdrawalSerializer(serializers.ModelSerializer):
 
 class CreateWithdrawalSerializer(serializers.Serializer):
     """
-    Withdraw an amount from a member's balance.
+    Withdraw an amount from a member's TOTAL balance (Brought Forward +
+    This Month combined) - not just the active cycle's deposits.
 
-    ✅ FIX: withdrawals are now scoped to the currently active cycle. The
-    "available balance" check and the FIFO draw-down BOTH only look at
-    deposits made within THIS SAME cycle — a withdrawal can never reach
-    back into a previous, already-settled cycle's deposits. This is what
-    keeps a brand-new cycle showing a clean, correct balance instead of
-    going negative because of unrelated withdrawal history.
+    Draws FIFO (oldest deposit first) across the member's entire history.
+    A member with 120,000 saved in July and 14,000 in August can withdraw
+    up to 134,000 in August; the withdrawal will first fully consume
+    July's old money before touching August's.
 
-    Consumes the OLDEST deposits first (FIFO) within the active cycle:
-    e.g. 10,000 saved on Day 1 and 10,000 on Day 2 of THIS cycle,
-    withdrawing 15,000 fully empties Day 1's entry and takes 5,000 from
-    Day 2's entry. Nothing is deleted — each deposit row keeps its
-    original amount, only `withdrawn_amount` increases, and this
-    withdrawal is logged with a reason so the money's movement stays
-    visible.
+    The monthly charge (see the new profit endpoints) is NOT affected by
+    this withdrawal, even if it draws from the same month's deposit - per
+    client confirmation, profit is based purely on what was collected.
     """
 
     member = serializers.PrimaryKeyRelatedField(queryset=MemberProfile.objects.all())
@@ -199,70 +200,35 @@ class CreateWithdrawalSerializer(serializers.Serializer):
     reason = serializers.CharField(max_length=255, required=False, allow_blank=True)
 
     def validate(self, data):
-        member = data['member']
-        amount = data['amount']
-
         active_cycle = SavingsCycle.objects.filter(status='active').first()
         if not active_cycle:
             raise serializers.ValidationError("No active savings cycle found")
         data['cycle'] = active_cycle
-
-        # ✅ Only THIS cycle's deposits count as available to withdraw.
-        available = SavingsEntry.objects.filter(
-            member=member, cycle=active_cycle
-        ).aggregate(
-            total=Sum(F('amount') - F('withdrawn_amount'))
-        )['total'] or Decimal('0.00')
-
-        if amount > available:
-            raise serializers.ValidationError(
-                f"Insufficient balance in the current cycle. "
-                f"Available balance is {available}."
-            )
+        # NOTE: no balance check here anymore - `execute_withdrawal()`
+        # does the check AND the allocation atomically in `create()`,
+        # against the member's full lifetime pool. Splitting the check
+        # from the allocation (like the old code did) is what let race
+        # conditions slip through; doing both in one atomic call closes
+        # that gap.
         return data
 
-    @transaction.atomic
     def create(self, validated_data):
         member = validated_data['member']
         cycle = validated_data['cycle']
-        amount_to_withdraw = validated_data['amount']
+        amount = validated_data['amount']
         reason = validated_data.get('reason') or 'Withdraw to be refilled'
         created_by = self.context['request'].user if self.context.get('request') else None
 
-        withdrawal = Withdrawal.objects.create(
-            member=member,
-            cycle=cycle,
-            amount=amount_to_withdraw,
-            date=validated_data['date'],
-            reason=reason,
-            created_by=created_by,
-        )
-
-        # Oldest deposits first (FIFO), locking rows to avoid race conditions.
-        # ✅ Scoped to this cycle only — never touches another cycle's entries.
-        entries = list(
-            SavingsEntry.objects.select_for_update()
-            .filter(member=member, cycle=cycle)
-            .order_by('date', 'created_at')
-        )
-
-        remaining_to_withdraw = amount_to_withdraw
-        for entry in entries:
-            if remaining_to_withdraw <= 0:
-                break
-            entry_remaining = entry.amount - entry.withdrawn_amount
-            if entry_remaining <= 0:
-                continue
-
-            take = min(entry_remaining, remaining_to_withdraw)
-            entry.withdrawn_amount = entry.withdrawn_amount + take
-            entry.save(update_fields=['withdrawn_amount', 'updated_at'])
-
-            WithdrawalAllocation.objects.create(
-                withdrawal=withdrawal,
-                savings_entry=entry,
-                amount=take,
+        try:
+            return execute_withdrawal(
+                member_id=member.id,
+                cycle=cycle,
+                amount=amount,
+                date=validated_data['date'],
+                reason=reason,
+                created_by=created_by,
             )
-            remaining_to_withdraw -= take
-
-        return withdrawal
+        except InsufficientBalanceForWithdrawal as exc:
+            raise serializers.ValidationError(
+                f"Insufficient balance. Available balance is {exc.available}."
+            )

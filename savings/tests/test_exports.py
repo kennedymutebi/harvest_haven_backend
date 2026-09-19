@@ -7,6 +7,7 @@ columns, row counts, and numbers matching reporting.py.
 
 from decimal import Decimal
 from datetime import date
+from savings.infrastructure import execute_withdrawal
 
 from django.test import TestCase
 from django.contrib.auth import get_user_model
@@ -66,9 +67,12 @@ class ExportTestBase(TestCase):
             amount=Decimal('20000.00'), date=date(2026, 8, 8),
             created_by=self.user,
         )
-        Withdrawal.objects.create(
-            member=self.member1, cycle=self.cycle,
-            amount=Decimal('10000.00'), date=date(2026, 8, 20),
+        execute_withdrawal(
+            member_id=self.member1.id,
+            cycle=self.cycle,
+            amount=Decimal('10000.00'),
+            date=date(2026, 8, 20),
+            reason='test withdrawal',
             created_by=self.user,
         )
 

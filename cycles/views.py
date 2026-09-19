@@ -11,12 +11,12 @@ from savings.serializers import SavingsCycleSerializer, CreateSavingsCycleSerial
 class CycleViewSet(viewsets.ModelViewSet):
     """
     Fully free savings cycle API.
-    
+
     - Create any cycle (past, present, future — no restrictions)
     - Multiple active cycles allowed
     - Delete any cycle at any time
-    - Close / reopen freely
-    
+    - Close / reopen freely (close now requires the cycle to be active)
+
     Endpoints:
         GET    /api/cycles/               → list all cycles
         POST   /api/cycles/               → create new cycle
@@ -24,7 +24,7 @@ class CycleViewSet(viewsets.ModelViewSet):
         PUT    /api/cycles/{id}/          → full update
         PATCH  /api/cycles/{id}/          → partial update
         DELETE /api/cycles/{id}/          → delete (no restrictions)
-        POST   /api/cycles/{id}/close/    → mark as closed
+        POST   /api/cycles/{id}/close/    → mark as closed (active cycles only)
         POST   /api/cycles/{id}/reopen/   → mark as active
         GET    /api/cycles/active/        → get first active cycle
         GET    /api/cycles/statistics/    → counts by status
@@ -54,10 +54,10 @@ class CycleViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         """
         POST /api/cycles/
-        
+
         Required:  start_date (YYYY-MM-DD)
         Optional:  name, end_date, status, interest_rate
-        
+
         No restrictions — create any cycle you want.
         """
         serializer = CreateSavingsCycleSerializer(data=request.data)
@@ -87,7 +87,7 @@ class CycleViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         """
         DELETE /api/cycles/{id}/
-        
+
         Permanently deletes cycle and ALL its savings entries.
         No status restrictions — any cycle can be deleted.
         """
@@ -117,9 +117,18 @@ class CycleViewSet(viewsets.ModelViewSet):
         """
         POST /api/cycles/{id}/close/
         Sets status='closed' and records today as end_date.
-        Works on any cycle regardless of current status.
+        Only active cycles can be closed — an already-closed or
+        upcoming cycle rejects this with 400, instead of silently
+        "re-closing" it.
         """
         cycle = self.get_object()
+
+        if cycle.status != 'active':
+            return Response(
+                {'detail': 'Only active cycles can be closed'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         cycle.status = 'closed'
         cycle.end_date = timezone.now().date()
         cycle.save()

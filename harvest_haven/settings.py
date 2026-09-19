@@ -1,8 +1,11 @@
 import os
+import sys
 from pathlib import Path
 from datetime import timedelta
 import pymysql
 from dotenv import load_dotenv
+TESTING = 'test' in sys.argv
+
 
 # Load environment variables FIRST
 load_dotenv()
@@ -215,6 +218,11 @@ CACHES = {
 SESSION_ENGINE = "django.contrib.sessions.backends.cache"
 SESSION_CACHE_ALIAS = "default"
 
+
+
+
+
+
 # Logging Configuration
 LOGGING = {
     'version': 1,
@@ -243,3 +251,9 @@ LOGGING = {
         'level': 'INFO',
     },
 }
+if TESTING:
+    LOGGING['loggers'] = LOGGING.get('loggers', {})
+    LOGGING['loggers']['django.request'] = {
+        'handlers': [],
+        'propagate': False,
+    }
