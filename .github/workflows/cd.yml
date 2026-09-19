@@ -2,14 +2,79 @@ name: CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
 
 concurrency:
   group: cd-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: harvest_haven
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wait for MySQL
+        run: |
+          until mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; do
+            echo "waiting for mysql..."
+            sleep 2
+          done
+
+      - name: Run domain tests (pure Python, no Django, no database)
+        run: |
+          python -m unittest discover -s savings_domain/tests -v
+
+      - name: Run Django tests (infrastructure + endpoints)
+        env:
+          DJANGO_SETTINGS_MODULE: harvest_haven.settings
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_NAME: harvest_haven
+          DB_USER: root
+          DB_PASSWORD: root
+          REDIS_URL: redis://127.0.0.1:6379/1
+        run: |
+          python manage.py test savings --verbosity=2
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,11 +100,37 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
+  # ───────────── 🟢 GREEN: push to develop ─────────────
+  deploy-green:
+    if: github.ref == 'refs/heads/develop'
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy to server
+      - name: Deploy to GREEN (test, port 8092)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            set -e
+            cd ~/harvest-haven-green
+            cp docker-compose.yml docker-compose.yml.prev
+            sed -i "s|image: kennedymutebi/harvest-haven-backend:.*|image: kennedymutebi/harvest-haven-backend:${{ github.sha }}|" docker-compose.yml
+            docker compose pull web
+            docker compose up -d web
+            sleep 15
+            echo "Green HTTP status: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8092/ || true)"
+            docker ps --filter name=harvest_haven_green
+
+  # ───────────── 🔵 BLUE: push/merge to main ─────────────
+  deploy-blue:
+    if: github.ref == 'refs/heads/main'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to BLUE (production, port 8082)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -49,8 +140,10 @@ jobs:
           script: |
             set -e
             cd ~/harvest-haven
+            cp docker-compose.yml docker-compose.yml.prev
             sed -i "s|image: kennedymutebi/harvest-haven-backend:.*|image: kennedymutebi/harvest-haven-backend:${{ github.sha }}|" docker-compose.yml
             docker compose pull web
             docker compose up -d web
-            docker compose exec -T web python manage.py migrate --noinput
-            docker image prune -f
+            sleep 15
+            echo "Blue HTTP status: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/ || true)"
+            docker ps --filter name=harvest_haven_web
