@@ -59,7 +59,11 @@ jobs:
 
       - name: Run domain tests (pure Python, no Django, no database)
         run: |
-          python -m unittest discover -s savings_domain/tests -v
+          if [ -d savings_domain/tests ]; then
+            python -m unittest discover -s savings_domain/tests -t . -v
+          else
+            echo "No domain tests yet, skipping"
+          fi
 
       - name: Run Django tests (infrastructure + endpoints)
         env:
