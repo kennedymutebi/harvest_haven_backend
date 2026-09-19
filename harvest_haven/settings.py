@@ -223,6 +223,9 @@ SESSION_CACHE_ALIAS = "default"
 
 
 
+# Ensure the log directory exists (CI and fresh Docker builds don't have it)
+(BASE_DIR / 'logs').mkdir(exist_ok=True)
+
 # Logging Configuration
 LOGGING = {
     'version': 1,
