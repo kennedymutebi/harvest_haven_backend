@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Q
 from django.http import HttpResponse
+from .infrastructure import get_balances_for_members
 from django.core.cache import cache
 from .models import SavingsCycle, SavingsEntry, Withdrawal
 from authentication.models import MemberProfile, Collector
@@ -422,16 +423,11 @@ class WithdrawalViewSet(viewsets.ModelViewSet):
 # VIEWS FOR "VIEW SAVINGS" PAGE
 # ============================================
 
-class MembersListWithSavingsView(APIView):
-    """
-    GET /api/view-savings/members/
 
-    PERFORMANCE NOTE: this used to run 2 DB queries PER MEMBER inside a
-    Python loop (N+1 problem) — with a few hundred members that meant
-    600+ queries and 20-30+ second load times. Now it runs 2 queries
-    TOTAL regardless of member count, using annotate+Sum grouped by
-    member_id, plus a short Redis cache on top for repeat requests.
-    """
+
+
+class MembersListWithSavingsView(APIView):
+    """GET /api/view-savings/members/"""
 
     permission_classes = [IsAuthenticated]
 
@@ -439,8 +435,6 @@ class MembersListWithSavingsView(APIView):
         search_query = request.GET.get('search', '').strip()
         show_all = request.GET.get('all', '').lower() == 'true'
 
-        # Cache key is scoped per-user + filters so nobody sees another
-        # user's filtered/restricted view from cache.
         cache_key = f"members_savings_{request.user.id}_{search_query}_{show_all}"
         try:
             cached = cache.get(cache_key)
@@ -461,8 +455,6 @@ class MembersListWithSavingsView(APIView):
             }
             return Response(data)
 
-        # select_related('user') avoids a separate query per member for
-        # member.user.first_name / last_name.
         members = MemberProfile.objects.filter(is_active_member=True).select_related('user')
 
         if not (show_all and (request.user.is_staff or request.user.is_superuser)):
@@ -475,18 +467,16 @@ class MembersListWithSavingsView(APIView):
                 Q(membership_id__icontains=search_query)
             )
 
-        members = list(members)  # evaluate once, reuse below
+        members = list(members)
         member_ids = [m.id for m in members]
 
-        # ONE query: total savings for ALL members, grouped by member_id.
-        savings_map = dict(
-            SavingsEntry.objects.filter(member_id__in=member_ids, cycle=active_cycle)
-            .values('member_id')
-            .annotate(total=Sum('amount'))
-            .values_list('member_id', 'total')
-        )
+        # Two queries total (all cycles + all entries for these members),
+        # regardless of member count — see get_balances_for_members.
+        balances = get_balances_for_members(member_ids, active_cycle)
 
-        # ONE query: total withdrawals for ALL members, grouped by member_id.
+        # Still needed separately: "withdrawn this month" is informational
+        # (gross withdrawal activity in this cycle), not part of the
+        # balance calculation itself.
         withdrawn_map = dict(
             Withdrawal.objects.filter(member_id__in=member_ids, cycle=active_cycle)
             .values('member_id')
@@ -496,7 +486,10 @@ class MembersListWithSavingsView(APIView):
 
         result = []
         for member in members:
-            total_savings = float(savings_map.get(member.id, 0) or 0)
+            balance = balances.get(member.id)
+            brought_forward = float(balance.brought_forward.amount) if balance else 0.0
+            this_month = float(balance.this_month.amount) if balance else 0.0
+            total_balance = brought_forward + this_month
             total_withdrawn = float(withdrawn_map.get(member.id, 0) or 0)
 
             result.append({
@@ -505,13 +498,14 @@ class MembersListWithSavingsView(APIView):
                 'first_name': member.user.first_name,
                 'last_name': member.user.last_name,
                 'membership_id': member.membership_id,
-                'total_savings': total_savings,
+                'brought_forward': brought_forward,   # NEW
+                'this_month': this_month,              # NEW
+                'total_balance': total_balance,        # NEW — use this, not 'balance'
                 'total_withdrawn': total_withdrawn,
-                'balance': total_savings - total_withdrawn,
                 'initials': f"{member.user.first_name[0]}{member.user.last_name[0]}".upper() if member.user.first_name and member.user.last_name else "??"
             })
 
-        result.sort(key=lambda x: x['total_savings'], reverse=True)
+        result.sort(key=lambda x: x['total_balance'], reverse=True)
 
         data = {
             'members': result,
@@ -519,10 +513,7 @@ class MembersListWithSavingsView(APIView):
             'cycle_name': active_cycle.name
         }
 
-        # 60s TTL — short enough that stale balances aren't a real problem,
-        # and we invalidate immediately on any create/update/delete anyway.
         cache.set(cache_key, data, timeout=60)
-
         return Response(data)
 
 
@@ -588,21 +579,27 @@ class MemberSavingsDetailView(APIView):
             'total_withdrawn_lifetime': float(total_withdrawn_lifetime),
             'net_balance_lifetime': float(total_lifetime) - float(total_withdrawn_lifetime),
 
-            # ✅ Frontend (WithdrawPage.tsx) reads this exact field name.
-            # Points at the ACTIVE CYCLE's balance — the same number the
-            # withdrawal endpoint validates against.
+            # WithdrawPage.tsx reads this exact name — Total Balance,
+            # what the withdrawal endpoint validates against.
             'net_balance': float(summary['closing_balance']),
 
-            'total_this_month': float(summary['savings']),
+            # FIXED: was summary['savings'] (gross deposits, ignores
+            # withdrawals) — now the correct remaining-this-month figure.
+            'total_this_month': float(summary['this_month']),
+
             'total_withdrawn_this_month': float(summary['withdrawals']),
-            'balance_this_month': float(summary['closing_balance']),
-            'carry_forward': float(summary['carry_forward']),
+
+            # FIXED: was summary['closing_balance'] (= Total Balance,
+            # wrongly labelled "this month"). Now actually this month.
+            'balance_this_month': float(summary['this_month']),
+
+            'carry_forward': float(summary['opening_balance']),   # matches existing test/frontend naming
+            'brought_forward': float(summary['opening_balance']),  # explicit alias, same value  # NEW — B/F, explicit
 
             'entries_count': entries.count(),
             'entries': entries_list,
             'withdrawals': withdrawals_list
         })
-
 
 class MemberSavingsHistoryView(APIView):
     """GET /api/view-savings/members/{member_id}/history/"""

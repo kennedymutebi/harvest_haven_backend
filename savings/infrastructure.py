@@ -177,3 +177,22 @@ def get_cycle_total_profit(cycle: SavingsCycle) -> Decimal:
     """
     lines = get_all_member_profits_for_cycle(cycle)
     return MemberProfitCalculator.total_profit(lines).amount
+def get_balances_for_members(member_ids: List[int], cycle: SavingsCycle) -> Dict[int, MemberBalance]:
+    """Bulk version of get_member_balance: ONE query for all cycles, ONE
+    query for every entry across all given members, then pure-Python
+    balance math per member (no further DB hits). This is what
+    MembersListWithSavingsView should use so showing B/F + This Month +
+    Total for a whole list still costs 2 queries total, not 2 per member."""
+    all_cycles = _all_cycle_refs()
+    cycle_ref = _to_cycle_ref(cycle)
+
+    entries = SavingsEntry.objects.filter(member_id__in=member_ids)
+    entries_by_member: Dict[int, List[LedgerEntry]] = {}
+    for entry in entries:
+        entries_by_member.setdefault(entry.member_id, []).append(_to_ledger_entry(entry))
+
+    calculator = BalanceCalculator()
+    return {
+        member_id: calculator.calculate(entries_by_member.get(member_id, []), cycle_ref, all_cycles)
+        for member_id in member_ids
+    }

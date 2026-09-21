@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -6,30 +8,12 @@ from django.utils import timezone
 
 from savings.models import SavingsCycle
 from savings.serializers import SavingsCycleSerializer, CreateSavingsCycleSerializer
+from savings.reporting import get_cycle_summary_for_all_members
+from savings.infrastructure import get_cycle_total_profit
+from authentication.models import MemberProfile
 
 
 class CycleViewSet(viewsets.ModelViewSet):
-    """
-    Fully free savings cycle API.
-
-    - Create any cycle (past, present, future — no restrictions)
-    - Multiple active cycles allowed
-    - Delete any cycle at any time
-    - Close / reopen freely (close now requires the cycle to be active)
-
-    Endpoints:
-        GET    /api/cycles/               → list all cycles
-        POST   /api/cycles/               → create new cycle
-        GET    /api/cycles/{id}/          → get single cycle
-        PUT    /api/cycles/{id}/          → full update
-        PATCH  /api/cycles/{id}/          → partial update
-        DELETE /api/cycles/{id}/          → delete (no restrictions)
-        POST   /api/cycles/{id}/close/    → mark as closed (active cycles only)
-        POST   /api/cycles/{id}/reopen/   → mark as active
-        GET    /api/cycles/active/        → get first active cycle
-        GET    /api/cycles/statistics/    → counts by status
-    """
-
     permission_classes = [IsAuthenticated]
     queryset = SavingsCycle.objects.all()
 
@@ -38,38 +22,22 @@ class CycleViewSet(viewsets.ModelViewSet):
             return CreateSavingsCycleSerializer
         return SavingsCycleSerializer
 
-    # ─── Standard CRUD ───────────────────────────────────────────────────────
-
     def list(self, request, *args, **kwargs):
-        """GET /api/cycles/ — list all cycles"""
         queryset = self.get_queryset()
         serializer = SavingsCycleSerializer(queryset, many=True)
         return Response(serializer.data)
 
     def retrieve(self, request, *args, **kwargs):
-        """GET /api/cycles/{id}/"""
         cycle = self.get_object()
         return Response(SavingsCycleSerializer(cycle).data)
 
     def create(self, request, *args, **kwargs):
-        """
-        POST /api/cycles/
-
-        Required:  start_date (YYYY-MM-DD)
-        Optional:  name, end_date, status, interest_rate
-
-        No restrictions — create any cycle you want.
-        """
         serializer = CreateSavingsCycleSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         cycle = serializer.save()
-        return Response(
-            SavingsCycleSerializer(cycle).data,
-            status=status.HTTP_201_CREATED
-        )
+        return Response(SavingsCycleSerializer(cycle).data, status=status.HTTP_201_CREATED)
 
     def update(self, request, *args, **kwargs):
-        """PUT /api/cycles/{id}/"""
         cycle = self.get_object()
         serializer = CreateSavingsCycleSerializer(cycle, data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -77,7 +45,6 @@ class CycleViewSet(viewsets.ModelViewSet):
         return Response(SavingsCycleSerializer(cycle).data)
 
     def partial_update(self, request, *args, **kwargs):
-        """PATCH /api/cycles/{id}/"""
         cycle = self.get_object()
         serializer = CreateSavingsCycleSerializer(cycle, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -88,47 +55,47 @@ class CycleViewSet(viewsets.ModelViewSet):
         """
         DELETE /api/cycles/{id}/
 
-        Permanently deletes cycle and ALL its savings entries.
-        No status restrictions — any cycle can be deleted.
+        FIXED: previously deleted the cycle AND cascaded to every savings
+        entry / withdrawal in it, unconditionally. Per the spec ("nothing
+        is ever deleted once money has moved") and per your own intent
+        ("not deleting information, just keep tracking the current
+        month"), a cycle that has any recorded activity can no longer be
+        deleted — only an empty (e.g. mistakenly created upcoming) cycle
+        can.
         """
         cycle = self.get_object()
+
+        if cycle.savings_entries.exists() or cycle.withdrawals.exists():
+            return Response(
+                {
+                    'error': (
+                        f'"{cycle.name}" has savings or withdrawals recorded '
+                        'and cannot be deleted. Correct individual entries '
+                        'instead of deleting the cycle.'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         cycle_name = cycle.name
         cycle.delete()
         return Response(
             {'detail': f'Cycle "{cycle_name}" deleted successfully.'},
-            status=status.HTTP_200_OK  # Returns message so frontend knows it worked
+            status=status.HTTP_200_OK
         )
-
-    # ─── Custom Actions ───────────────────────────────────────────────────────
 
     @action(detail=False, methods=['get'])
     def active(self, request):
-        """GET /api/cycles/active/ — returns first active cycle"""
         cycle = SavingsCycle.objects.filter(status='active').first()
         if not cycle:
-            return Response(
-                {'detail': 'No active cycle found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({'detail': 'No active cycle found'}, status=status.HTTP_404_NOT_FOUND)
         return Response(SavingsCycleSerializer(cycle).data)
 
     @action(detail=True, methods=['post'])
     def close(self, request, pk=None):
-        """
-        POST /api/cycles/{id}/close/
-        Sets status='closed' and records today as end_date.
-        Only active cycles can be closed — an already-closed or
-        upcoming cycle rejects this with 400, instead of silently
-        "re-closing" it.
-        """
         cycle = self.get_object()
-
         if cycle.status != 'active':
-            return Response(
-                {'detail': 'Only active cycles can be closed'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
+            return Response({'detail': 'Only active cycles can be closed'}, status=status.HTTP_400_BAD_REQUEST)
         cycle.status = 'closed'
         cycle.end_date = timezone.now().date()
         cycle.save()
@@ -136,20 +103,50 @@ class CycleViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def reopen(self, request, pk=None):
-        """
-        POST /api/cycles/{id}/reopen/
-        Sets status='active' and clears end_date.
-        No restriction — reopen even if another active cycle exists.
-        """
         cycle = self.get_object()
         cycle.status = 'active'
         cycle.end_date = None
         cycle.save()
         return Response(SavingsCycleSerializer(cycle).data)
 
+    @action(detail=True, methods=['get'])
+    def close_preview(self, request, pk=None):
+        """
+        GET /api/cycles/{id}/close_preview/
+
+        NEW. Whole-cycle summary shown to the admin before confirming
+        close: combined opening balance (B/F across all members),
+        this cycle's saved/withdrawn, the resulting closing balance, and
+        the total Section-7 fee — computed live, nothing stored.
+        """
+        cycle = self.get_object()
+        if cycle.status != 'active':
+            return Response(
+                {'detail': 'Only an active cycle can be previewed for closing'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        members = MemberProfile.objects.filter(is_active_member=True)
+        rows = get_cycle_summary_for_all_members(cycle, members)
+
+        opening_balance = sum((r['opening_balance'] for r in rows), Decimal('0.00'))
+        total_saved = sum((r['savings'] for r in rows), Decimal('0.00'))
+        total_withdrawn = sum((r['withdrawals'] for r in rows), Decimal('0.00'))
+        closing_balance = sum((r['closing_balance'] for r in rows), Decimal('0.00'))
+        total_fees = get_cycle_total_profit(cycle)
+
+        return Response({
+            'cycle': {'id': cycle.id, 'name': cycle.name},
+            'opening_balance': float(opening_balance),
+            'total_saved': float(total_saved),
+            'total_withdrawn': float(total_withdrawn),
+            'closing_balance': float(closing_balance),
+            'total_fees': float(total_fees),
+            'members_count': len(rows),
+        })
+
     @action(detail=False, methods=['get'])
     def statistics(self, request):
-        """GET /api/cycles/statistics/"""
         return Response({
             'total': SavingsCycle.objects.count(),
             'active': SavingsCycle.objects.filter(status='active').count(),
