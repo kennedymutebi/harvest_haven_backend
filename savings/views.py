@@ -1,6 +1,7 @@
 from decimal import Decimal
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from .infrastructure import get_balances_for_members
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -230,14 +231,9 @@ class MemberSearchView(APIView):
 # COLLECTOR SUMMARY
 # ============================================
 
-class CollectorSavingsSummaryView(APIView):
-    """
-    GET /api/savings/collectors/{collector_id}/summary/?date=YYYY-MM-DD
-    GET /api/savings/collectors/{collector_id}/summary/?month=YYYY-MM
-    GET /api/savings/collectors/{collector_id}/summary/?cycle=<cycle_id>
-    GET /api/savings/collectors/{collector_id}/summary/   (all-time)
-    """
 
+
+class CollectorSavingsSummaryView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, collector_id):
@@ -247,49 +243,71 @@ class CollectorSavingsSummaryView(APIView):
             return Response({'error': 'Collector not found'}, status=status.HTTP_404_NOT_FOUND)
 
         members = MemberProfile.objects.filter(collector=collector)
-
-        entries = SavingsEntry.objects.filter(member__in=members)
-        withdrawals = Withdrawal.objects.filter(member__in=members)
+        member_ids = list(members.values_list('id', flat=True))
 
         date_str = request.query_params.get('date')
         month_str = request.query_params.get('month')
         cycle_id = request.query_params.get('cycle')
 
         if cycle_id:
-            entries = entries.filter(cycle_id=cycle_id)
-            withdrawals = withdrawals.filter(cycle_id=cycle_id)
-            period_label = f'cycle:{cycle_id}'
-        elif date_str:
-            entries = entries.filter(date=date_str)
-            withdrawals = withdrawals.filter(date=date_str)
-            period_label = date_str
-        elif month_str:
             try:
+                cycle = SavingsCycle.objects.get(id=cycle_id)
+            except SavingsCycle.DoesNotExist:
+                return Response({'error': 'Cycle not found'}, status=status.HTTP_404_NOT_FOUND)
+
+            # Allocation-aware, same calculator MembersListWithSavingsView
+            # uses — NOT a flat entries-minus-withdrawals subtraction,
+            # because withdrawals tagged to this cycle may have drawn
+            # from brought-forward money from earlier cycles.
+            balances = get_balances_for_members(member_ids, cycle)
+            total_saved = sum(b.this_month.amount for b in balances.values())
+            total_withdrawn = float(
+                Withdrawal.objects.filter(member_id__in=member_ids, cycle_id=cycle_id)
+                .aggregate(total=Sum('amount'))['total'] or 0
+            )  # gross withdrawal activity this cycle — informational only
+            net_balance = float(sum(b.this_month.amount for b in balances.values()))
+            entries_count = SavingsEntry.objects.filter(
+                member_id__in=member_ids, cycle_id=cycle_id
+            ).count()
+            period_label = f'cycle:{cycle_id}'
+
+        elif date_str or month_str:
+            entries = SavingsEntry.objects.filter(member_id__in=member_ids)
+            withdrawals = Withdrawal.objects.filter(member_id__in=member_ids)
+            if date_str:
+                entries = entries.filter(date=date_str)
+                withdrawals = withdrawals.filter(date=date_str)
+                period_label = date_str
+            else:
                 year, month = month_str.split('-')
                 entries = entries.filter(date__year=year, date__month=month)
                 withdrawals = withdrawals.filter(date__year=year, date__month=month)
-            except ValueError:
-                return Response(
-                    {'error': 'month must be in YYYY-MM format'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            period_label = month_str
-        else:
-            period_label = 'all-time'
+                period_label = month_str
+            total_saved = float(entries.aggregate(total=Sum('amount'))['total'] or 0)
+            total_withdrawn = float(withdrawals.aggregate(total=Sum('amount'))['total'] or 0)
+            net_balance = total_saved - total_withdrawn
+            entries_count = entries.count()
 
-        total_saved = entries.aggregate(total=Sum('amount'))['total'] or 0
-        total_withdrawn = withdrawals.aggregate(total=Sum('amount'))['total'] or 0
+        else:
+            # All-time: flat subtraction is correct here — no cycle
+            # boundary is being crossed, so FIFO order doesn't matter.
+            entries = SavingsEntry.objects.filter(member_id__in=member_ids)
+            withdrawals = Withdrawal.objects.filter(member_id__in=member_ids)
+            total_saved = float(entries.aggregate(total=Sum('amount'))['total'] or 0)
+            total_withdrawn = float(withdrawals.aggregate(total=Sum('amount'))['total'] or 0)
+            net_balance = total_saved - total_withdrawn
+            entries_count = entries.count()
+            period_label = 'all-time'
 
         return Response({
             'collector': {'id': collector.id, 'name': collector.name},
             'period': period_label,
             'total_saved': float(total_saved),
             'total_withdrawn': float(total_withdrawn),
-            'net_balance': float(total_saved) - float(total_withdrawn),
+            'net_balance': float(net_balance),
             'members_count': members.count(),
-            'entries_count': entries.count(),
+            'entries_count': entries_count,
         })
-
 
 # ============================================
 # CYCLES
