@@ -7,7 +7,8 @@ from django.utils import timezone
 from datetime import timedelta
 from savings.models import SavingsCycle, SavingsEntry
 from authentication.models import MemberProfile
-
+from savings.infrastructure import get_cycle_total_profit, get_all_member_profits_for_cycle
+from savings_domain.profit_service import MemberProfitCalculator
 
 class DashboardView(APIView):
     """Main dashboard statistics"""
@@ -33,7 +34,8 @@ class DashboardView(APIView):
         total_savings = active_cycle.total_savings()
         
         # Total profit
-        total_profit = active_cycle.total_profit()
+        # Total profit
+        total_profit = get_cycle_total_profit(active_cycle)
         
         # Active members
         active_members = MemberProfile.objects.filter(is_active_member=True).count()
@@ -90,18 +92,16 @@ class SavingsTrendView(APIView):
         
         trend_data = []
         for item in monthly_data:
-            # Calculate profit based on interest rate
             cycle = SavingsCycle.objects.filter(
                 start_date__lte=item['month'],
                 end_date__gte=item['month']
             ).first()
-            
-            interest_rate = cycle.interest_rate if cycle else 18.4
+
             savings = item['total_savings'] or 0
-            profit = float(savings) * (float(interest_rate) / 100)
-            
+            profit = float(get_cycle_total_profit(cycle)) if cycle else 0.0
+
             trend_data.append({
-                'month': item['month'].strftime('%b'),  # "May", "Jun", "Jul"...
+                'month': item['month'].strftime('%b'),
                 'savings': float(savings),
                 'profit': round(profit, 2)
             })
