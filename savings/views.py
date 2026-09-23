@@ -8,6 +8,7 @@ from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Q
 from django.http import HttpResponse
 from .infrastructure import get_balances_for_members
+
 from django.core.cache import cache
 from .models import SavingsCycle, SavingsEntry, Withdrawal
 from authentication.models import MemberProfile, Collector
@@ -16,7 +17,7 @@ from .serializers import (
     SavingsEntrySerializer, CreateSavingsEntrySerializer,
     WithdrawalSerializer, CreateWithdrawalSerializer
 )
-from .infrastructure import get_balances_for_members, get_member_profit_for_cycle
+from .infrastructure import get_balances_for_members, get_member_profit_for_cycle,get_all_member_profits_for_cycle
 from .reporting import get_member_cycle_summary, get_member_lifetime_history
 from .exports import (
     build_cycle_export,
@@ -251,16 +252,21 @@ class CollectorSavingsSummaryView(APIView):
         month_str = request.query_params.get('month')
         cycle_id = request.query_params.get('cycle')
 
+        def _profit_for_cycle(cycle_obj):
+            """Sum of this collector's members' tiered charges for one
+            cycle. Independent of withdrawals — see MemberProfitCalculator,
+            sums entry.amount not entry.remaining."""
+            if not cycle_obj:
+                return 0.0
+            lines = get_all_member_profits_for_cycle(cycle_obj)
+            return float(sum(l.charge.amount for l in lines if l.member_id in member_ids))
+
         if cycle_id:
             try:
                 cycle = SavingsCycle.objects.get(id=cycle_id)
             except SavingsCycle.DoesNotExist:
                 return Response({'error': 'Cycle not found'}, status=status.HTTP_404_NOT_FOUND)
 
-            # Allocation-aware, same calculator MembersListWithSavingsView
-            # uses — NOT a flat entries-minus-withdrawals subtraction,
-            # because withdrawals tagged to this cycle may have drawn
-            # from brought-forward money from earlier cycles.
             balances = get_balances_for_members(member_ids, cycle)
             total_saved = sum(b.this_month.amount for b in balances.values())
             total_withdrawn = float(
@@ -272,6 +278,7 @@ class CollectorSavingsSummaryView(APIView):
                 member_id__in=member_ids, cycle_id=cycle_id
             ).count()
             period_label = f'cycle:{cycle_id}'
+            total_profit = _profit_for_cycle(cycle)
 
         elif date_str or month_str:
             entries = SavingsEntry.objects.filter(member_id__in=member_ids)
@@ -280,15 +287,28 @@ class CollectorSavingsSummaryView(APIView):
                 entries = entries.filter(date=date_str)
                 withdrawals = withdrawals.filter(date=date_str)
                 period_label = date_str
+                target_date = date_str
             else:
                 year, month = month_str.split('-')
                 entries = entries.filter(date__year=year, date__month=month)
                 withdrawals = withdrawals.filter(date__year=year, date__month=month)
                 period_label = month_str
+                target_date = f'{year}-{month}-01'
             total_saved = float(entries.aggregate(total=Sum('amount'))['total'] or 0)
             total_withdrawn = float(withdrawals.aggregate(total=Sum('amount'))['total'] or 0)
             net_balance = total_saved - total_withdrawn
             entries_count = entries.count()
+
+            # Profit is a monthly/cycle concept, not a daily one — use
+            # whichever cycle actually covers this date, so "Today" still
+            # shows this month's real charge rather than a meaningless
+            # daily figure.
+            cycle_for_period = SavingsCycle.objects.filter(
+                start_date__lte=target_date
+            ).filter(
+                Q(end_date__gte=target_date) | Q(end_date__isnull=True)
+            ).order_by('-start_date').first()
+            total_profit = _profit_for_cycle(cycle_for_period)
 
         else:
             # All-time: flat subtraction is correct here — no cycle
@@ -301,16 +321,22 @@ class CollectorSavingsSummaryView(APIView):
             entries_count = entries.count()
             period_label = 'all-time'
 
+            # Lifetime profit: sum this collector's members' charge across
+            # every cycle they've ever been charged in.
+            total_profit = sum(
+                _profit_for_cycle(c) for c in SavingsCycle.objects.all()
+            )
+
         return Response({
             'collector': {'id': collector.id, 'name': collector.name},
             'period': period_label,
             'total_saved': float(total_saved),
             'total_withdrawn': float(total_withdrawn),
             'net_balance': float(net_balance),
+            'total_profit': float(total_profit),
             'members_count': members.count(),
             'entries_count': entries_count,
         })
-
 # ============================================
 # CYCLES
 # ============================================
