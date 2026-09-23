@@ -16,6 +16,7 @@ from .serializers import (
     SavingsEntrySerializer, CreateSavingsEntrySerializer,
     WithdrawalSerializer, CreateWithdrawalSerializer
 )
+from .infrastructure import get_balances_for_members, get_member_profit_for_cycle
 from .reporting import get_member_cycle_summary, get_member_lifetime_history
 from .exports import (
     build_cycle_export,
@@ -553,6 +554,13 @@ class MemberSavingsDetailView(APIView):
 
         summary = get_member_cycle_summary(member, active_cycle)
 
+        # What she's actually being charged this cycle, and the raw
+        # amount it's based on. Deliberately independent of any
+        # withdrawal — MemberProfitCalculator sums entry.amount, not
+        # entry.remaining, so this never changes just because money
+        # was withdrawn.
+        profit_line = get_member_profit_for_cycle(member.id, active_cycle)
+
         entries = SavingsEntry.objects.filter(
             member=member, cycle=active_cycle
         ).order_by('-date', '-created_at')
@@ -598,28 +606,24 @@ class MemberSavingsDetailView(APIView):
             'total_withdrawn_lifetime': float(total_withdrawn_lifetime),
             'net_balance_lifetime': float(total_lifetime) - float(total_withdrawn_lifetime),
 
-            # WithdrawPage.tsx reads this exact name — Total Balance,
-            # what the withdrawal endpoint validates against.
             'net_balance': float(summary['closing_balance']),
 
-            # FIXED: was summary['savings'] (gross deposits, ignores
-            # withdrawals) — now the correct remaining-this-month figure.
             'total_this_month': float(summary['this_month']),
 
             'total_withdrawn_this_month': float(summary['withdrawals']),
 
-            # FIXED: was summary['closing_balance'] (= Total Balance,
-            # wrongly labelled "this month"). Now actually this month.
             'balance_this_month': float(summary['this_month']),
 
-            'carry_forward': float(summary['opening_balance']),   # matches existing test/frontend naming
-            'brought_forward': float(summary['opening_balance']),  # explicit alias, same value  # NEW — B/F, explicit
+            'carry_forward': float(summary['opening_balance']),
+            'brought_forward': float(summary['opening_balance']),
+
+            'monthly_charge': float(profit_line.charge.amount),
+            'collected_this_month': float(profit_line.collected_this_month.amount),
 
             'entries_count': entries.count(),
             'entries': entries_list,
             'withdrawals': withdrawals_list
         })
-
 class MemberSavingsHistoryView(APIView):
     """GET /api/view-savings/members/{member_id}/history/"""
 
