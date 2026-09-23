@@ -43,13 +43,18 @@ def _to_ledger_entry(entry: SavingsEntry) -> LedgerEntry:
 
 
 def _member_entries_oldest_first(member_id: int) -> List[SavingsEntry]:
-    """Every entry this member has EVER made, across every cycle, oldest
-    first. This is the query that changes from the old
-    CreateWithdrawalSerializer - no `.filter(cycle=active_cycle)` here."""
+    """Every entry this member has EVER made, oldest cycle first, then
+    oldest date within that cycle. Ordering by cycle start_date (not
+    entry.date) is required because a late/backdated entry can have a
+    recent `date` while belonging to an old, closed cycle — see
+    LateSavingsEntryView. FIFO must follow cycle chronology, matching
+    BalanceCalculator's Brought Forward vs This Month split, or the two
+    will disagree about which money is "older"."""
     return list(
         SavingsEntry.objects.select_for_update()
         .filter(member_id=member_id)
-        .order_by('date', 'created_at')
+        .select_related('cycle')
+        .order_by('cycle__start_date', 'date', 'created_at')
     )
 
 
