@@ -148,6 +148,23 @@ class CreateSavingsEntrySerializer(serializers.Serializer):
     def create(self, validated_data):
         return SavingsEntry.objects.create(**validated_data)
 
+class UpdateSavingsEntrySerializer(serializers.Serializer):
+    """
+    Partial update of an existing savings entry (amount / date / comment
+    only). Member and cycle are set at creation and never change here —
+    correcting a wrong member or moving an entry to a different cycle is
+    a delete-and-recreate, not an edit.
+    """
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.01'), required=False)
+    date = serializers.DateField(required=False)
+    comment = serializers.CharField(required=False, allow_blank=True)
+
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
+
 
 class WithdrawalAllocationSerializer(serializers.ModelSerializer):
     """Read-only breakdown of which day's deposit a withdrawal drew from"""

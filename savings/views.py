@@ -14,7 +14,7 @@ from .models import SavingsCycle, SavingsEntry, Withdrawal
 from authentication.models import MemberProfile, Collector
 from .serializers import (
     SavingsCycleSerializer, CreateSavingsCycleSerializer,
-    SavingsEntrySerializer, CreateSavingsEntrySerializer,
+    SavingsEntrySerializer, CreateSavingsEntrySerializer,UpdateSavingsEntrySerializer,
     WithdrawalSerializer, CreateWithdrawalSerializer
 )
 from .infrastructure import get_balances_for_members, get_member_profit_for_cycle,get_all_member_profits_for_cycle
@@ -116,13 +116,13 @@ class SavingsEntryViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def update(self, request, *args, **kwargs):
-        """PUT /api/savings/{id}/"""
+        """PUT/PATCH /api/savings/{id}/"""
         entry = self.get_object()
-        serializer = CreateSavingsEntrySerializer(entry, data=request.data)
+        partial = request.method == 'PATCH'
+        serializer = UpdateSavingsEntrySerializer(entry, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         entry = serializer.save()
 
-        # Invalidate cache on update too — amount may have changed.
         try:
             cache.delete_pattern("*members_savings_*")
         except Exception as e:
@@ -138,7 +138,6 @@ class SavingsEntryViewSet(viewsets.ModelViewSet):
             logger.error(f"SMS update notification failed: {str(e)}")
 
         return Response(SavingsEntrySerializer(entry).data)
-
     def destroy(self, request, *args, **kwargs):
         """
         DELETE /api/savings/{id}/
