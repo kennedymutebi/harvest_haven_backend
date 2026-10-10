@@ -15,21 +15,30 @@ class MemberProfileSerializer(serializers.ModelSerializer):
             'national_id', 'emergency_contact_name', 'emergency_contact_phone'
         ]
         read_only_fields = ['membership_id', 'date_joined']
-
 class CollectorSerializer(serializers.ModelSerializer):
-    """Serializer for Collector — name + phone only, admin-managed."""
-
+    """Collector: name + phone, plus how many members are attached."""
+ 
+    members_count = serializers.SerializerMethodField()
+ 
     class Meta:
         model = Collector
-        fields = ['id', 'name', 'phone_number', 'is_active', 'created_at']
-        read_only_fields = ['id', 'created_at']
-
+        fields = ['id', 'name', 'phone_number', 'is_active', 'created_at', 'members_count']
+        read_only_fields = ['id', 'created_at', 'members_count']
+ 
+    def get_members_count(self, obj):
+        # The viewset annotates `member_total` so the list needs one query,
+        # not one per collector. Fall back to a count for create/update.
+        annotated = getattr(obj, 'member_total', None)
+        if annotated is not None:
+            return annotated
+        return MemberProfile.objects.filter(collector=obj).count()
+ 
     def validate_name(self, value):
         value = value.strip()
         if not value:
             raise serializers.ValidationError("Name cannot be empty.")
         return value
-
+ 
     def validate_phone_number(self, value):
         if not value or not value.strip():
             return None
